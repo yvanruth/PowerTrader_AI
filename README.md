@@ -23,29 +23,29 @@ For determining when to sell, the bot uses a trailing profit margin to maximize 
 
 ---
 
-## Wijzigingen ten opzichte van de originele repository
+## Changes from the Original Repository
 
-Deze fork bevat de volgende belangrijke wijzigingen en verbeteringen:
+This fork contains the following important changes and improvements:
 
-- **API Migratie**: Overstap van Kucoin naar Binance API voor price history data, en van Robinhood naar Kraken API voor trading
-- **Paper Trading Mode**: Volledige paper trading functionaliteit toegevoegd om de bot te testen zonder echt geld te gebruiken
-- **Performance Optimalisaties**: 
-  - NumPy vectorized operations voor snellere berekeningen
-  - Numba JIT compilation voor kritieke functies
-  - Caching systeem voor price history (disk) en memories/weights (in-memory)
-  - Early exit optimalisaties voor pattern matching
-- **UI Verbeteringen**:
-  - Exchange selectie (Kraken/Robinhood) in GUI settings
+- **API Migration**: Switched from Kucoin to Binance API for price history data, and from Robinhood to Kraken API for trading
+- **Paper Trading Mode**: Full paper trading functionality added to test the bot without using real money
+- **Performance Optimizations**: 
+  - NumPy vectorized operations for faster calculations
+  - Numba JIT compilation for critical functions
+  - Caching system for price history (disk) and memories/weights (in-memory)
+  - Early exit optimizations for pattern matching
+- **UI Improvements**:
+  - Exchange selection (Kraken/Robinhood) in GUI settings
   - Paper trading toggle in settings
-  - Verbeterde chart label spacing (verticale positionering)
-  - Betere status updates voor training en trading
-- **Robustheid**:
-  - Verbeterde error handling en logging
-  - Cross-platform path normalisatie fixes
-  - Betere foutafhandeling voor API calls
-- **Structuur**:
-  - BTC files verplaatst naar aparte `BTC/` folder
-  - `.gitignore` toegevoegd voor gevoelige bestanden en runtime data
+  - Improved chart label spacing (vertical positioning)
+  - Better status updates for training and trading
+- **Robustness**:
+  - Improved error handling and logging
+  - Cross-platform path normalization fixes
+  - Better error handling for API calls
+- **Structure**:
+  - BTC files moved to separate `BTC/` folder
+  - `.gitignore` added for sensitive files and runtime data
 
 ---
 
