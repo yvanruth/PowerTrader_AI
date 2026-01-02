@@ -2,8 +2,102 @@ import os
 import time
 import random
 import requests
-from kucoin.client import Market
-market = Market(url='https://api.kucoin.com')
+# Binance API (replaces Kucoin)
+def get_binance_kline(symbol, interval, start_time=None, end_time=None, limit=1000):
+	"""
+	Fetch kline data from Binance API.
+	Converts Binance format to Kucoin-compatible format.
+	"""
+	# Timeframe mapping: Kucoin -> Binance
+	tf_map = {
+		'1hour': '1h',
+		'2hour': '2h',
+		'4hour': '4h',
+		'8hour': '8h',
+		'12hour': '12h',
+		'1day': '1d',
+		'1week': '1w'
+	}
+	
+	binance_interval = tf_map.get(interval, interval)
+	
+	# Convert symbol: BTC-USDT -> BTCUSDT
+	binance_symbol = symbol.replace('-', '')
+	
+	url = f"https://api.binance.com/api/v3/klines"
+	params = {
+		'symbol': binance_symbol,
+		'interval': binance_interval,
+		'limit': min(limit, 1000)  # Binance max is 1000
+	}
+	
+	if start_time:
+		params['startTime'] = int(start_time * 1000)  # Binance uses milliseconds
+	if end_time:
+		params['endTime'] = int(end_time * 1000)
+	
+	try:
+		response = requests.get(url, params=params, timeout=10)
+		response.raise_for_status()
+		data = response.json()
+		
+		# Convert Binance format to Kucoin-compatible format
+		# Binance: [timestamp, open, high, low, close, volume, ...]
+		# Kucoin: [timestamp, open, close, high, low, volume]
+		result = []
+		for candle in data:
+			timestamp = int(candle[0] / 1000)  # Convert milliseconds to seconds
+			open_price = float(candle[1])
+			high_price = float(candle[2])
+			low_price = float(candle[3])
+			close_price = float(candle[4])
+			volume = float(candle[5])
+			
+			# Format as Kucoin-style string: [timestamp, open, close, high, low, volume]
+			candle_str = f"[{timestamp}, {open_price}, {close_price}, {high_price}, {low_price}, {volume}]"
+			result.append(candle_str)
+		
+		return result
+	except Exception as e:
+		print(f"Binance API error: {e}", flush=True)
+		raise
+
+class BinanceMarket:
+	"""Compatible interface with old Kucoin market object."""
+	def __init__(self):
+		pass
+	
+	def get_kline(self, symbol, interval, startAt=None, endAt=None):
+		"""Get kline data - compatible with old Kucoin interface."""
+		try:
+			result = get_binance_kline(symbol, interval, start_time=startAt, end_time=endAt)
+			# Convert list to Kucoin-compatible string format: [[candle1], [candle2], ...]
+			if isinstance(result, list) and len(result) > 0:
+				return '[' + ', '.join(result) + ']'
+			# Return empty list format if no data
+			return '[]'
+		except Exception as e:
+			print(f"BinanceMarket.get_kline error for {symbol}/{interval}: {e}", flush=True)
+			# Return empty list format on error
+			return '[]'
+	
+	def get_ticker(self, symbol):
+		"""Get current ticker price."""
+		binance_symbol = symbol.replace('-', '')
+		url = f"https://api.binance.com/api/v3/ticker/price"
+		params = {'symbol': binance_symbol}
+		try:
+			response = requests.get(url, params=params, timeout=10)
+			response.raise_for_status()
+			data = response.json()
+			# Return in Kucoin-compatible format
+			return f'{{"price": {data["price"]}}}'
+		except Exception as e:
+			print(f"Binance ticker error: {e}", flush=True)
+			return '{"price": 0}'
+
+# Initialize Binance market (replaces Kucoin)
+market = BinanceMarket()
 import sys
 import datetime
 import traceback
@@ -18,102 +112,47 @@ import logging
 import json
 import uuid
 
-from nacl.signing import SigningKey
-
 # -----------------------------
-# Robinhood market-data (current ASK), same source as rhcb.py trader:
-#   GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
-#   use result["ask_inclusive_of_buy_spread"]
+# Kraken market-data (current ASK), using public ticker endpoint:
+#   GET /0/public/Ticker?pair=XBTUSD
+#   use result["a"][0] (ask price)
 # -----------------------------
-ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
+KRAKEN_BASE_URL = "https://api.kraken.com"
 
-_RH_MD = None  # lazy-init so import doesn't explode if creds missing
+def convert_symbol_to_kraken(symbol: str) -> str:
+    """Convert internal symbol format (BTC-USD) to Kraken format (XBTUSD)."""
+    base = symbol.replace("-USD", "").replace("-USDT", "")
+    if base == "BTC":
+        return "XBTUSD"
+    return f"{base}USD"
 
-
-class RobinhoodMarketData:
-    def __init__(self, api_key: str, base64_private_key: str, base_url: str = ROBINHOOD_BASE_URL, timeout: int = 10):
-        self.api_key = (api_key or "").strip()
-        self.base_url = (base_url or "").rstrip("/")
-        self.timeout = timeout
-
-        if not self.api_key:
-            raise RuntimeError("Robinhood API key is empty (r_key.txt).")
-
-        try:
-            raw_private = base64.b64decode((base64_private_key or "").strip())
-            self.private_key = SigningKey(raw_private)
-        except Exception as e:
-            raise RuntimeError(f"Failed to decode Robinhood private key (r_secret.txt): {e}")
-
-        self.session = requests.Session()
-
-    def _get_current_timestamp(self) -> int:
-        return int(time.time())
-
-    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> dict:
-        # matches the trader's signing format
-        method = method.upper()
-        body = body or ""
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        signature_b64 = base64.b64encode(signed.signature).decode("utf-8")
-
-        return {
-            "x-api-key": self.api_key,
-            "x-timestamp": str(timestamp),
-            "x-signature": signature_b64,
-            "Content-Type": "application/json",
-        }
-
-    def make_api_request(self, method: str, path: str, body: str = "") -> dict:
-        url = f"{self.base_url}{path}"
-        ts = self._get_current_timestamp()
-        headers = self._get_authorization_header(method, path, body, ts)
-
-        resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Robinhood HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
-
-    def get_current_ask(self, symbol: str) -> float:
-        symbol = (symbol or "").strip().upper()
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-        data = self.make_api_request("GET", path)
-
-        if not data or "results" not in data or not data["results"]:
-            raise RuntimeError(f"Robinhood best_bid_ask returned no results for {symbol}: {data}")
-
-        result = data["results"][0]
-        # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
-        return float(result["ask_inclusive_of_buy_spread"])
-
-
-def robinhood_current_ask(symbol: str) -> float:
+def kraken_current_ask(symbol: str) -> float:
     """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
+    Returns Kraken current ASK price for symbols like 'BTC-USD'.
+    Uses public ticker endpoint (no authentication required).
     """
-    global _RH_MD
-    if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
-
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
-
-
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
-
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
-
-    return _RH_MD.get_current_ask(symbol)
+    try:
+        kraken_symbol = convert_symbol_to_kraken(symbol)
+        path = f"/0/public/Ticker?pair={kraken_symbol}"
+        url = f"{KRAKEN_BASE_URL}{path}"
+        
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "result" not in data or not data["result"]:
+            raise RuntimeError(f"Kraken ticker returned no results for {symbol} (Kraken: {kraken_symbol}): {data}")
+        
+        # Get the first (and usually only) result
+        ticker_data = list(data["result"].values())[0]
+        if "a" not in ticker_data or not ticker_data["a"]:
+            raise RuntimeError(f"Kraken ticker missing 'a' (ask) field for {symbol}: {ticker_data}")
+        
+        ask_price = float(ticker_data["a"][0])
+        return ask_price
+    except Exception as e:
+        print(f"Kraken price fetch error for {symbol}: {e}", flush=True)
+        raise
 
 
 def restart_program():
@@ -197,8 +236,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
-	# Your "main folder is BTC folder" convention:
-	return BASE_DIR if sym == 'BTC' else os.path.join(BASE_DIR, sym)
+	# BTC now uses its own folder like other coins
+	if sym == 'BTC':
+		btc_path = os.path.join(BASE_DIR, 'BTC')
+		# Use BTC folder if it exists, otherwise fallback to BASE_DIR
+		return btc_path if os.path.isdir(btc_path) else BASE_DIR
+	return os.path.join(BASE_DIR, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---
@@ -376,58 +419,99 @@ _write_runner_ready(False, stage="starting", ready_coins=[], total_coins=len(CUR
 
 def init_coin(sym: str):
 	# switch into the coin's folder so ALL existing relative file I/O stays working
-	os.chdir(coin_folder(sym))
+	try:
+		os.chdir(coin_folder(sym))
+	except Exception as e:
+		print(f"Failed to chdir for {sym}: {e}", flush=True)
+		raise
 
 	# per-coin "version" + on/off files (no collisions between coins)
-	with open('alerts_version.txt', 'w+') as f:
-		f.write('5/3/2022/9am')
+	try:
+		with open('alerts_version.txt', 'w+') as f:
+			f.write('5/3/2022/9am')
 
-	with open('futures_long_onoff.txt', 'w+') as f:
-		f.write('OFF')
+		with open('futures_long_onoff.txt', 'w+') as f:
+			f.write('OFF')
 
-	with open('futures_short_onoff.txt', 'w+') as f:
-		f.write('OFF')
+		with open('futures_short_onoff.txt', 'w+') as f:
+			f.write('OFF')
+	except Exception as e:
+		print(f"Failed to write init files for {sym}: {e}", flush=True)
 
 	st = new_coin_state()
 
 	coin = sym + '-USDT'
 	ind = 0
 	tf_times_local = []
-	while True:
+	max_retries = 10
+	while ind < len(tf_choices):
 		history_list = []
-		while True:
+		retry_count = 0
+		while retry_count < max_retries:
 			try:
 				history = str(market.get_kline(coin, tf_choices[ind])).replace(']]', '], ').replace('[[', '[')
+				# Check if we got valid data
+				if not history or history == '[]':
+					raise ValueError("Empty history returned")
 				break
 			except Exception as e:
+				retry_count += 1
 				time.sleep(3.5)
-				if 'Requests' in str(e):
-					pass
-				else:
+				if retry_count >= max_retries:
+					print(f"Failed to get kline for {coin}/{tf_choices[ind]} after {max_retries} retries: {e}", flush=True)
 					PrintException()
-				continue
+					the_time = 0.0
+					tf_times_local.append(the_time)
+					ind += 1
+					continue
 
-		history_list = history.split("], [")
-		ind += 1
-		try:
-			working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
-			the_time = working_minute[0].replace('[', '')
-		except Exception:
-			the_time = 0.0
+		if retry_count < max_retries:
+			history_list = history.split("], [")
+			ind += 1
+			try:
+				if len(history_list) >= 2:
+					working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
+					the_time = working_minute[0].replace('[', '')
+				else:
+					# Try first element if second doesn't exist
+					if len(history_list) >= 1:
+						working_minute = str(history_list[0]).replace('"', '').replace("'", "").replace('[', '').replace(']', '').split(", ")
+						the_time = working_minute[0] if len(working_minute) > 0 else '0.0'
+					else:
+						the_time = 0.0
+			except Exception as e:
+				print(f"Failed to parse history for {coin}/{tf_choices[ind-1]}: {e}", flush=True)
+				the_time = 0.0
 
-		tf_times_local.append(the_time)
-		if len(tf_times_local) >= len(tf_choices):
-			break
+			tf_times_local.append(the_time)
 
 	st['tf_times'] = tf_times_local
 	states[sym] = st
 
 # init all coins once (from GUI settings)
 for _sym in CURRENT_COINS:
-	init_coin(_sym)
+	try:
+		init_coin(_sym)
+	except Exception as e:
+		print(f"Failed to init {_sym}: {e}", flush=True)
+		PrintException()
+		# Set coin to error state
+		try:
+			display_cache[_sym] = f"{_sym}  (ERROR - check logs)"
+		except:
+			pass
+		# Add empty state so step_coin() doesn't crash
+		try:
+			if _sym not in states:
+				states[_sym] = new_coin_state()
+		except:
+			pass
 
 # restore CWD to base after init
-os.chdir(BASE_DIR)
+try:
+	os.chdir(BASE_DIR)
+except:
+	pass
 
 
 wallet_addr_list = []
@@ -476,8 +560,26 @@ def find_purple_area(lines):
     return (None, None)
 def step_coin(sym: str):
 	# run inside the coin folder so all existing file reads/writes stay relative + isolated
-	os.chdir(coin_folder(sym))
+	try:
+		os.chdir(coin_folder(sym))
+	except Exception as e:
+		print(f"Failed to chdir for {sym} in step_coin: {e}", flush=True)
+		try:
+			display_cache[sym] = f"{sym}  (ERROR - folder issue)"
+		except:
+			pass
+		return
+	
 	coin = sym + '-USDT'
+	
+	# Check if coin state exists (initialized)
+	if sym not in states:
+		try:
+			display_cache[sym] = f"{sym}  (NOT INITIALIZED - init failed)"
+		except:
+			pass
+		return
+	
 	st = states[sym]
 
 	# --- training freshness gate ---
@@ -580,9 +682,18 @@ def step_coin(sym: str):
 	current_candle = 100 * ((closePrice - openPrice) / openPrice)
 
 	# ====== ORIGINAL: load threshold + memories/weights and compute moves ======
-	file = open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'r')
-	perfect_threshold = float(file.read())
-	file.close()
+	threshold_path = 'neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt'
+	try:
+		if os.path.isfile(threshold_path):
+			file = open(threshold_path, 'r')
+			perfect_threshold = float(file.read())
+			file.close()
+		else:
+			# Default threshold if file doesn't exist
+			perfect_threshold = 0.5
+	except Exception as e:
+		print(f"Failed to read threshold for {sym}/{tf_choices[tf_choice_index]}: {e}", flush=True)
+		perfect_threshold = 0.5
 
 	try:
 		# If we can read/parse training files, this timeframe is NOT a training-file issue.
@@ -697,14 +808,46 @@ def step_coin(sym: str):
 	price_list2 = [openPrice, closePrice]
 	current_pattern = [price_list2[0], price_list2[1]]
 
+	# Fetch current market price for this coin (cached per coin to avoid repeated API calls)
+	if 'current_market_price' not in st or st.get('current_market_price_timestamp', 0) < time.time() - 5:
+		# Fetch current price if not cached or cache is older than 5 seconds
+		kraken_symbol = f"{sym}-USD"
+		try:
+			st['current_market_price'] = kraken_current_ask(kraken_symbol)
+			st['current_market_price_timestamp'] = time.time()
+		except:
+			# Fallback to closePrice if API call fails
+			st['current_market_price'] = closePrice
+			st['current_market_price_timestamp'] = time.time()
+	
+	current_market_price = st.get('current_market_price', closePrice)
+
 	try:
 		c_diff = final_moves / 100
 		high_diff = high_final_moves
 		low_diff = low_final_moves
 
-		start_price = current_pattern[len(current_pattern) - 1]
+		# Use current market price instead of old candle closePrice for predictions
+		# This ensures predictions are based on current price, not historical candle data
+		start_price = current_market_price
 		high_new_price = start_price + (start_price * high_diff)
 		low_new_price = start_price + (start_price * low_diff)
+		
+		# Validate predictions: if they're more than 90% away from start_price, they're likely corrupted
+		# Cap extreme predictions to reasonable bounds (±90% from start_price)
+		max_deviation = 0.90  # 90% max deviation
+		if start_price > 0:
+			if abs(high_new_price - start_price) / start_price > max_deviation:
+				if high_new_price > start_price:
+					high_new_price = start_price * (1 + max_deviation)
+				else:
+					high_new_price = start_price * (1 - max_deviation)
+			
+			if abs(low_new_price - start_price) / start_price > max_deviation:
+				if low_new_price > start_price:
+					low_new_price = start_price * (1 + max_deviation)
+				else:
+					low_new_price = start_price * (1 - max_deviation)
 	except:
 		start_price = current_pattern[len(current_pattern) - 1]
 		high_new_price = start_price
@@ -730,15 +873,26 @@ def step_coin(sym: str):
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
 		tf_update = ['no'] * len(tf_choices)
 
-		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
-		rh_symbol = f"{sym}-USD"
-		while True:
+		# get current price ONCE per coin — use Kraken's current ASK (same as trader buy price)
+		kraken_symbol = f"{sym}-USD"
+		current = None
+		retry_count = 0
+		max_price_retries = 5
+		while retry_count < max_price_retries:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = kraken_current_ask(kraken_symbol)
 				break
-			except Exception:
+			except Exception as e:
+				retry_count += 1
+				if retry_count >= max_price_retries:
+					print(f"Failed to get price for {kraken_symbol} after {max_price_retries} retries: {e}", flush=True)
+					# Use a fallback price (0.0) if we can't get the real price
+					current = 0.0
+					break
 				time.sleep(1)
-				continue
+		
+		if current is None:
+			current = 0.0
 
 		# IMPORTANT: messages printed below use the bounds currently in state.
 		# We only allow "ready" once messages are generated using a non-startup bounds_version.
@@ -883,13 +1037,21 @@ def step_coin(sym: str):
 		while True:
 			new_low_price = low_tf_prices[prices_index] - (low_tf_prices[prices_index] * (distance / 100))
 			new_high_price = high_tf_prices[prices_index] + (high_tf_prices[prices_index] * (distance / 100))
+			
+			# Ensure boundaries are always positive (prices cannot be negative)
+			if new_low_price <= 0:
+				# If low boundary would be negative, set it to a small positive value (0.1% of high_tf_price or 0.01, whichever is larger)
+				new_low_price = max(0.01, high_tf_prices[prices_index] * 0.001) if high_tf_prices[prices_index] > 0 else 0.01
+			if new_high_price <= 0:
+				# If high boundary would be negative, set it to a small positive value
+				new_high_price = max(0.01, low_tf_prices[prices_index] * 1.001) if low_tf_prices[prices_index] > 0 else 0.01
 			if perfects[prices_index] != 'inactive':
 				low_bound_prices.append(new_low_price)
 				high_bound_prices.append(new_high_price)
 			else:
 				low_bound_prices.append(.01)
 				high_bound_prices.append(99999999999999999)
-
+			
 			prices_index += 1
 			if prices_index >= len(high_tf_prices):
 				break
@@ -984,12 +1146,12 @@ def step_coin(sym: str):
 
 
 
-			all_ready = len(_ready_coins) >= len(COIN_SYMBOLS)
+			all_ready = len(_ready_coins) >= len(CURRENT_COINS)
 			_write_runner_ready(
 				all_ready,
 				stage=("real_predictions" if all_ready else "warming_up"),
 				ready_coins=sorted(list(_ready_coins)),
-				total_coins=len(COIN_SYMBOLS),
+				total_coins=len(CURRENT_COINS),
 			)
 
 		except:

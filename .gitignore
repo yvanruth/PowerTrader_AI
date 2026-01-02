@@ -1,0 +1,62 @@
+# API Credentials - Never commit sensitive keys
+kraken_key.txt
+kraken_secret.txt
+r_key.txt
+r_secret.txt
+
+# Runtime price data
+*_current_price.txt
+
+# Runtime data directories
+hub_data/
+price_history/
+
+# Coin training data and memories (all .txt files in coin folders)
+BNB/*.txt
+BTC/*.txt
+ETH/*.txt
+XRP/*.txt
+DOGE/*.txt
+
+# Coin HTML files (generated)
+BNB/*.html
+BTC/*.html
+ETH/*.html
+XRP/*.html
+DOGE/*.html
+
+# Coin JSON status files
+BNB/*.json
+BTC/*.json
+ETH/*.json
+XRP/*.json
+DOGE/*.json
+
+# Coin Python trainer files (copied to each folder)
+BNB/pt_trainer.py
+BTC/pt_trainer.py
+ETH/pt_trainer.py
+XRP/pt_trainer.py
+DOGE/pt_trainer.py
+
+# Runtime futures config
+futures_long_onoff.txt
+futures_short_onoff.txt
+
+# System files
+.DS_Store
+.cursor/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

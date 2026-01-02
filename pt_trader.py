@@ -4,6 +4,9 @@ import json
 import uuid
 import time
 import math
+import hmac
+import hashlib
+import urllib.parse
 from typing import Any, Dict, Optional
 import requests
 from nacl.signing import SigningKey
@@ -42,6 +45,7 @@ _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
 	"main_neural_dir": None,
+	"paper_trading": False,
 }
 
 def _load_gui_settings() -> dict:
@@ -49,6 +53,7 @@ def _load_gui_settings() -> dict:
 	Reads gui_settings.json and returns a dict with:
 	- coins: uppercased list
 	- main_neural_dir: string (may be None)
+	- paper_trading: bool (may be None/False)
 	Caches by mtime so it is cheap to call frequently.
 	"""
 	try:
@@ -75,14 +80,20 @@ def _load_gui_settings() -> dict:
 		else:
 			main_neural_dir = None
 
+		paper_trading = data.get("paper_trading", False)
+		if not isinstance(paper_trading, bool):
+			paper_trading = False
+
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
 		_gui_settings_cache["main_neural_dir"] = main_neural_dir
+		_gui_settings_cache["paper_trading"] = paper_trading
 
 		return {
 			"mtime": mtime,
 			"coins": list(coins),
 			"main_neural_dir": main_neural_dir,
+			"paper_trading": paper_trading,
 		}
 	except Exception:
 		return dict(_gui_settings_cache)
@@ -90,18 +101,24 @@ def _load_gui_settings() -> dict:
 def _build_base_paths(main_dir_in: str, coins_in: list) -> dict:
 	"""
 	Safety rule:
-	- BTC uses main_dir directly
+	- BTC uses <main_dir>/BTC folder (if it exists, otherwise falls back to main_dir)
 	- other coins use <main_dir>/<SYM> ONLY if that folder exists
 	  (no fallback to BTC folder — avoids corrupting BTC data)
 	"""
-	out = {"BTC": main_dir_in}
+	# BTC now uses its own folder like other coins
+	btc_path = os.path.join(main_dir_in, "BTC")
+	if os.path.isdir(btc_path):
+		out = {"BTC": btc_path}
+	else:
+		# Fallback to main_dir if BTC folder doesn't exist yet
+		out = {"BTC": main_dir_in}
 	try:
 		for sym in coins_in:
 			sym = str(sym).strip().upper()
 			if not sym:
 				continue
 			if sym == "BTC":
-				out["BTC"] = main_dir_in
+				# Already set above
 				continue
 			sub = os.path.join(main_dir_in, sym)
 			if os.path.isdir(sub):
@@ -152,36 +169,181 @@ def _refresh_paths_and_symbols():
 
 
 #API STUFF
+# Determine which exchange to use
+EXCHANGE = "robinhood"  # default
+try:
+    gui_settings = _load_gui_settings()
+    EXCHANGE = gui_settings.get("exchange", "robinhood").lower()
+    if EXCHANGE not in ("robinhood", "kraken"):
+        EXCHANGE = "robinhood"
+except Exception:
+    pass
+
 API_KEY = ""
 BASE64_PRIVATE_KEY = ""
+KRAKEN_API_KEY = ""
+KRAKEN_PRIVATE_KEY = ""
 
-try:
-    with open('r_key.txt', 'r', encoding='utf-8') as f:
-        API_KEY = (f.read() or "").strip()
-    with open('r_secret.txt', 'r', encoding='utf-8') as f:
-        BASE64_PRIVATE_KEY = (f.read() or "").strip()
-except Exception:
-    API_KEY = ""
-    BASE64_PRIVATE_KEY = ""
+# Paper trading mode: check in order of priority:
+# 1. Environment variable
+# 2. GUI settings (gui_settings.json)
+# 3. paper_trading.txt file
+PAPER_TRADING_MODE = os.environ.get("POWERTRADER_PAPER_MODE", "").lower() in ("1", "true", "yes", "on")
+if not PAPER_TRADING_MODE:
+    try:
+        # Check GUI settings
+        gui_settings = _load_gui_settings()
+        PAPER_TRADING_MODE = bool(gui_settings.get("paper_trading", False))
+    except Exception:
+        pass
 
-if not API_KEY or not BASE64_PRIVATE_KEY:
+if not PAPER_TRADING_MODE:
+    try:
+        # Fallback to paper_trading.txt file
+        if os.path.isfile("paper_trading.txt"):
+            with open("paper_trading.txt", "r", encoding="utf-8") as f:
+                content = f.read().strip().lower()
+                PAPER_TRADING_MODE = content in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+
+# Load exchange-specific credentials
+if EXCHANGE == "robinhood":
+    try:
+        with open('r_key.txt', 'r', encoding='utf-8') as f:
+            API_KEY = (f.read() or "").strip()
+        with open('r_secret.txt', 'r', encoding='utf-8') as f:
+            BASE64_PRIVATE_KEY = (f.read() or "").strip()
+    except Exception:
+        API_KEY = ""
+        BASE64_PRIVATE_KEY = ""
+elif EXCHANGE == "kraken":
+    try:
+        with open('kraken_key.txt', 'r', encoding='utf-8') as f:
+            KRAKEN_API_KEY = (f.read() or "").strip()
+        with open('kraken_secret.txt', 'r', encoding='utf-8') as f:
+            KRAKEN_PRIVATE_KEY = (f.read() or "").strip()
+    except Exception:
+        KRAKEN_API_KEY = ""
+        KRAKEN_PRIVATE_KEY = ""
+
+if not PAPER_TRADING_MODE:
+    if EXCHANGE == "robinhood" and (not API_KEY or not BASE64_PRIVATE_KEY):
+        print(
+            "\n[PowerTrader] Robinhood API credentials not found.\n"
+            "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
+            "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
+            "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
+            "\nAlternatively, create a file named 'paper_trading.txt' with 'yes' to enable paper trading mode\n"
+            "for testing without real money or API credentials.\n"
+        )
+        raise SystemExit(1)
+    elif EXCHANGE == "kraken" and (not KRAKEN_API_KEY or not KRAKEN_PRIVATE_KEY):
+        print(
+            "\n[PowerTrader] Kraken API credentials not found.\n"
+            "Please create two files:\n"
+            "  - kraken_key.txt (your Kraken API Key)\n"
+            "  - kraken_secret.txt (your Kraken Private Key)\n"
+            "\nYou can create these in your Kraken account: Settings → API → Create API Key\n"
+            "Make sure to enable 'Query Funds' and 'Create & Modify Orders' permissions.\n"
+            "\nAlternatively, enable Paper Trading Mode in Settings to test without credentials.\n"
+        )
+        raise SystemExit(1)
+
+if PAPER_TRADING_MODE:
     print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
+        "\n" + "="*60 + "\n"
+        f"[PowerTrader] PAPER TRADING MODE ENABLED ({EXCHANGE.upper()})\n"
+        "All orders will be simulated - no real trades will be placed.\n"
+        "="*60 + "\n"
     )
-    raise SystemExit(1)
+else:
+    print(f"\n[PowerTrader] Using {EXCHANGE.upper()} exchange\n")
+
+# Symbol mapping for different exchanges
+def convert_symbol_to_exchange(symbol: str, exchange: str) -> str:
+    """Convert internal symbol format (BTC-USD) to exchange-specific format."""
+    if exchange == "kraken":
+        # Kraken uses: XBTUSD, ETHUSD, etc. (BTC is XBT on Kraken)
+        base = symbol.replace("-USD", "").replace("-USDT", "")
+        if base == "BTC":
+            return "XBTUSD"
+        return f"{base}USD"
+    else:  # robinhood
+        return symbol  # Robinhood uses BTC-USD format
+
+def convert_symbol_from_exchange(symbol: str, exchange: str) -> str:
+    """Convert exchange-specific symbol format to internal format (BTC-USD)."""
+    if exchange == "kraken":
+        # Kraken returns various pair formats:
+        # - XBTUSD, XXBTZUSD -> BTC-USD
+        # - ETHUSD, XETHZUSD -> ETH-USD
+        # - XRPUSD, XXRPZUSD -> XRP-USD
+        # - DOGEUSD, XDGUSD -> DOGE-USD
+        # - BNBUSD -> BNB-USD
+        symbol_upper = symbol.upper()
+        
+        # Handle BTC variants
+        if symbol_upper.startswith("XXBTZ") or symbol_upper.startswith("XBT"):
+            return "BTC-USD"
+        # Handle ETH variants
+        if symbol_upper.startswith("XETHZ") or symbol_upper.startswith("ETH"):
+            return "ETH-USD"
+        # Handle XRP variants
+        if symbol_upper.startswith("XXRPZ") or symbol_upper.startswith("XRP"):
+            return "XRP-USD"
+        # Handle DOGE variants
+        if symbol_upper.startswith("XDG") or symbol_upper.startswith("DOGE"):
+            return "DOGE-USD"
+        # Handle BNB
+        if symbol_upper.startswith("BNB"):
+            return "BNB-USD"
+        
+        # Fallback: try to extract base currency and add -USD
+        if symbol_upper.endswith("USD"):
+            base = symbol_upper[:-3]
+            # Remove common Kraken prefixes
+            base = base.replace("X", "").replace("Z", "")
+            return f"{base}-USD"
+        
+        return symbol
+    else:  # robinhood
+        return symbol
 
 class CryptoAPITrading:
     def __init__(self):
         # keep a copy of the folder map (same idea as trader.py)
         self.path_map = dict(base_paths)
 
-        self.api_key = API_KEY
-        private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
+        # Exchange type
+        self.exchange = EXCHANGE
+
+        # Paper trading mode flag
+        self.paper_trading = PAPER_TRADING_MODE
+
+        if not self.paper_trading:
+            if self.exchange == "robinhood":
+                self.api_key = API_KEY
+                private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
+                self.private_key = SigningKey(private_key_seed)
+                self.base_url = "https://trading.robinhood.com"
+            elif self.exchange == "kraken":
+                self.api_key = KRAKEN_API_KEY
+                self.private_key = KRAKEN_PRIVATE_KEY
+                self.base_url = "https://api.kraken.com"
+        else:
+            # Paper trading: initialize simulated account state
+            self._paper_account = {
+                "buying_power": 10000.0,  # Start with $10,000 in paper trading
+                "total_account_value": 10000.0,
+            }
+            self._paper_holdings = {}  # { "BTC": {"quantity": 0.0, "cost_basis": 0.0, "orders": []}, ... }
+            self._paper_orders = []  # List of all simulated orders for cost basis calculation
+            # Set base_url for price fetching (public endpoints work without auth)
+            if self.exchange == "kraken":
+                self.base_url = "https://api.kraken.com"
+            else:
+                self.base_url = "https://trading.robinhood.com"
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0]  # Moved to instance variable
@@ -619,7 +781,20 @@ class CryptoAPITrading:
 
 
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
+        # In paper trading mode, don't make real API calls
+        if self.paper_trading:
+            return None
+        if self.exchange == "kraken":
+            return self._make_kraken_request(method, path, body)
+        else:
+            return self._make_robinhood_request(method, path, body)
 
+    def _make_robinhood_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
+        # Should not be called in paper trading mode (make_api_request should catch this)
+        if self.paper_trading:
+            return None
+        if not hasattr(self, 'api_key') or not hasattr(self, 'private_key'):
+            return None
         timestamp = self._get_current_timestamp()
         headers = self.get_authorization_header(method, path, body, timestamp)
         url = self.base_url + path
@@ -634,9 +809,66 @@ class CryptoAPITrading:
             return response.json()
         except requests.HTTPError as http_err:
             try:
-                # Parse and return the JSON error response
                 error_response = response.json()
-                return error_response  # Return the JSON error for further handling
+                return error_response
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _make_kraken_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
+        """Kraken API uses HMAC-SHA512 signing with nonce."""
+        # Should not be called in paper trading mode (make_api_request should catch this)
+        if self.paper_trading:
+            return None
+        if not hasattr(self, 'api_key') or not hasattr(self, 'private_key'):
+            return None
+        url = self.base_url + path
+        
+        # Kraken requires a nonce (incrementing number or timestamp)
+        nonce = str(int(time.time() * 1000))
+        
+        # For POST requests, add nonce to data
+        if method == "POST":
+            if body:
+                data = json.loads(body)
+            else:
+                data = {}
+            data["nonce"] = nonce
+            post_data = urllib.parse.urlencode(data)
+        else:
+            post_data = ""
+        
+        # Create signature: HMAC-SHA512 of (URI path + SHA256(nonce + post_data)) + base64 decode of secret
+        message = (nonce + post_data).encode('utf-8')
+        message_hash = hashlib.sha256(message).digest()
+        signature_input = path.encode('utf-8') + message_hash
+        secret = base64.b64decode(self.private_key)
+        signature = hmac.new(secret, signature_input, hashlib.sha512).digest()
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+        
+        headers = {
+            "API-Key": self.api_key,
+            "API-Sign": signature_b64,
+        }
+        
+        try:
+            if method == "GET":
+                response = requests.get(url, headers=headers, timeout=10)
+            elif method == "POST":
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                response = requests.post(url, headers=headers, data=post_data, timeout=10)
+            
+            response.raise_for_status()
+            result = response.json()
+            # Kraken wraps responses in "result" key, and errors in "error"
+            if "error" in result and result["error"]:
+                return {"errors": [{"detail": str(result["error"])}]}
+            return result.get("result", result)
+        except requests.HTTPError as http_err:
+            try:
+                error_response = response.json()
+                return error_response
             except Exception:
                 return None
         except Exception:
@@ -645,6 +877,10 @@ class CryptoAPITrading:
     def get_authorization_header(
             self, method: str, path: str, body: str, timestamp: int
     ) -> Dict[str, str]:
+        """Robinhood authorization header (Ed25519 signing)."""
+        # Should not be called in paper trading mode
+        if self.paper_trading or not hasattr(self, 'api_key') or not hasattr(self, 'private_key'):
+            return {}
         message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
         signed = self.private_key.sign(message_to_sign.encode("utf-8"))
 
@@ -655,34 +891,149 @@ class CryptoAPITrading:
         }
 
     def get_account(self) -> Any:
-        path = "/api/v1/crypto/trading/accounts/"
-        return self.make_api_request("GET", path)
+        if self.paper_trading:
+            # Return simulated account data
+            return {
+                "buying_power": str(self._paper_account["buying_power"]),
+                "total_account_value": str(self._paper_account["total_account_value"]),
+            }
+        if self.exchange == "kraken":
+            # Kraken: /0/private/Balance endpoint
+            path = "/0/private/Balance"
+            response = self.make_api_request("POST", path, "{}")
+            if response and "error" not in response:
+                # Get USD balance (ZUSD on Kraken)
+                usd_balance = float(response.get("ZUSD", 0.0))
+                return {
+                    "buying_power": str(usd_balance),
+                    "total_account_value": str(usd_balance),  # Will be updated with holdings value in manage_trades
+                }
+            return {}
+        else:  # robinhood
+            path = "/api/v1/crypto/trading/accounts/"
+            return self.make_api_request("GET", path)
 
     def get_holdings(self) -> Any:
-        path = "/api/v1/crypto/trading/holdings/"
-        return self.make_api_request("GET", path)
+        if self.paper_trading:
+            # Return simulated holdings
+            results = []
+            for asset_code, holding in self._paper_holdings.items():
+                if holding["quantity"] > 0:
+                    results.append({
+                        "asset_code": asset_code,
+                        "total_quantity": str(holding["quantity"]),
+                    })
+            return {"results": results}
+        if self.exchange == "kraken":
+            # Kraken: /0/private/Balance endpoint
+            path = "/0/private/Balance"
+            response = self.make_api_request("POST", path, "{}")
+            if response and "error" not in response:
+                results = []
+                # Kraken asset codes: XBT, ETH, etc. (need to convert to BTC, ETH)
+                # Also skip ZUSD (USD) and other fiat currencies
+                skip_assets = {"ZUSD", "ZEUR", "ZGBP", "ZJPY"}  # Common fiat currencies
+                for asset, balance in response.items():
+                    if asset in skip_assets:
+                        continue  # Skip fiat currencies
+                    qty = float(balance)
+                    if qty > 0:
+                        # Convert Kraken asset code to standard (XBT -> BTC)
+                        asset_code = "BTC" if asset == "XBT" else asset
+                        results.append({
+                            "asset_code": asset_code,
+                            "total_quantity": str(qty),
+                        })
+                return {"results": results}
+            return {"results": []}
+        else:  # robinhood
+            path = "/api/v1/crypto/trading/holdings/"
+            return self.make_api_request("GET", path)
 
     def get_trading_pairs(self) -> Any:
-        path = "/api/v1/crypto/trading/trading_pairs/"
-        response = self.make_api_request("GET", path)
-
-        if not response or "results" not in response:
+        # In paper trading mode, return a simulated list of common trading pairs
+        if self.paper_trading:
+            # Return common crypto trading pairs for paper trading
+            common_pairs = [
+                {"symbol": "BTC-USD", "base_currency": "BTC", "quote_currency": "USD"},
+                {"symbol": "ETH-USD", "base_currency": "ETH", "quote_currency": "USD"},
+                {"symbol": "BNB-USD", "base_currency": "BNB", "quote_currency": "USD"},
+                {"symbol": "DOGE-USD", "base_currency": "DOGE", "quote_currency": "USD"},
+                {"symbol": "XRP-USD", "base_currency": "XRP", "quote_currency": "USD"},
+            ]
+            return common_pairs
+        
+        if self.exchange == "kraken":
+            # Kraken: /0/public/AssetPairs endpoint (public, no auth needed)
+            path = "/0/public/AssetPairs"
+            response = requests.get(self.base_url + path, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if "result" in data:
+                    # Return list of pair names
+                    return list(data["result"].keys())
             return []
-
-        trading_pairs = response.get("results", [])
-        if not trading_pairs:
-            return []
-
-        return trading_pairs
+        else:  # robinhood
+            path = "/api/v1/crypto/trading/trading_pairs/"
+            response = self.make_api_request("GET", path)
+            if not response or "results" not in response:
+                return []
+            trading_pairs = response.get("results", [])
+            if not trading_pairs:
+                return []
+            return trading_pairs
 
     def get_orders(self, symbol: str) -> Any:
-        path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
-        return self.make_api_request("GET", path)
+        if self.paper_trading:
+            # Return simulated orders for this symbol
+            asset_code = symbol.replace("-USD", "").replace("-USDT", "")
+            if asset_code in self._paper_holdings:
+                return {"results": self._paper_holdings[asset_code]["orders"]}
+            return {"results": []}
+        if self.exchange == "kraken":
+            # Kraken: /0/private/ClosedOrders or /0/private/OpenOrders
+            # For cost basis, we need closed/filled orders
+            path = "/0/private/ClosedOrders"
+            response = self.make_api_request("POST", path, json.dumps({"trades": True}))
+            if response and "error" not in response:
+                # Convert Kraken order format to our format
+                orders = []
+                closed = response.get("closed", {})
+                for order_id, order_data in closed.items():
+                    pair = order_data.get("descr", {}).get("pair", "")
+                    # Convert from Kraken format (XBTUSD) to our format (BTC-USD)
+                    our_symbol = convert_symbol_from_exchange(pair, "kraken")
+                    if our_symbol == symbol:
+                        orders.append({
+                            "id": order_id,
+                            "side": "buy" if order_data.get("descr", {}).get("type") == "buy" else "sell",
+                            "state": "filled",
+                            "created_at": str(order_data.get("opentm", "")),
+                            "executions": [{
+                                "quantity": str(order_data.get("vol", "0")),
+                                "effective_price": str(order_data.get("price", "0")),
+                            }]
+                        })
+                return {"results": orders}
+            return {"results": []}
+        else:  # robinhood
+            path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
+            return self.make_api_request("GET", path)
 
     def calculate_cost_basis(self):
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
             return {}
+
+        if self.paper_trading:
+            # For paper trading, use the stored cost basis from holdings
+            cost_basis = {}
+            for asset_code, holding in self._paper_holdings.items():
+                if holding["quantity"] > 0:
+                    cost_basis[asset_code] = holding["cost_basis"]
+                else:
+                    cost_basis[asset_code] = 0.0
+            return cost_basis
 
         active_assets = {holding["asset_code"] for holding in holdings.get("results", [])}
         current_quantities = {
@@ -738,42 +1089,137 @@ class CryptoAPITrading:
         sell_prices = {}
         valid_symbols = []
 
-        for symbol in symbols:
-            if symbol == "USDC-USD":
-                continue
-
-            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-            response = self.make_api_request("GET", path)
-
-            if response and "results" in response:
-                result = response["results"][0]
-                ask = float(result["ask_inclusive_of_buy_spread"])
-                bid = float(result["bid_inclusive_of_sell_spread"])
-
-                buy_prices[symbol] = ask
-                sell_prices[symbol] = bid
-                valid_symbols.append(symbol)
-
-                # Update cache for transient failures later
+        # In paper trading mode, use public Kraken API for prices (works without auth)
+        if self.paper_trading:
+            # Use Kraken public ticker endpoint for all symbols in paper trading
+            kraken_symbols = [convert_symbol_to_exchange(s, "kraken") for s in symbols if s != "USDC-USD"]
+            if kraken_symbols:
+                pairs_str = ",".join(kraken_symbols)
+                path = f"/0/public/Ticker?pair={pairs_str}"
                 try:
-                    self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
-                except Exception:
+                    kraken_base = "https://api.kraken.com"
+                    response = requests.get(kraken_base + path, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if "result" in data:
+                            for kraken_pair, ticker_data in data["result"].items():
+                                our_symbol = convert_symbol_from_exchange(kraken_pair, "kraken")
+                                if our_symbol in symbols:
+                                    ask = float(ticker_data.get("a", [0])[0])
+                                    bid = float(ticker_data.get("b", [0])[0])
+                                    if ask > 0 and bid > 0:
+                                        buy_prices[our_symbol] = ask
+                                        sell_prices[our_symbol] = bid
+                                        valid_symbols.append(our_symbol)
+                                        try:
+                                            self._last_good_bid_ask[our_symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
+                                        except Exception:
+                                            pass
+                except Exception as e:
                     pass
-            else:
-                # Fallback to cached bid/ask so account value never drops due to a transient miss
-                cached = None
-                try:
+            
+            # Fallback to cache for any missing symbols
+            for symbol in symbols:
+                if symbol == "USDC-USD":
+                    continue
+                if symbol not in buy_prices:
                     cached = self._last_good_bid_ask.get(symbol)
-                except Exception:
-                    cached = None
+                    if cached:
+                        ask = float(cached.get("ask", 0.0) or 0.0)
+                        bid = float(cached.get("bid", 0.0) or 0.0)
+                        if ask > 0.0 and bid > 0.0:
+                            buy_prices[symbol] = ask
+                            sell_prices[symbol] = bid
+                            valid_symbols.append(symbol)
+            
+            return buy_prices, sell_prices, valid_symbols
 
-                if cached:
-                    ask = float(cached.get("ask", 0.0) or 0.0)
-                    bid = float(cached.get("bid", 0.0) or 0.0)
-                    if ask > 0.0 and bid > 0.0:
-                        buy_prices[symbol] = ask
-                        sell_prices[symbol] = bid
-                        valid_symbols.append(symbol)
+        if self.exchange == "kraken":
+            # Kraken: batch fetch ticker data (public endpoint)
+            kraken_symbols = [convert_symbol_to_exchange(s, "kraken") for s in symbols if s != "USDC-USD"]
+            if not kraken_symbols:
+                return buy_prices, sell_prices, valid_symbols
+            
+            # Kraken allows comma-separated pairs
+            pairs_str = ",".join(kraken_symbols)
+            path = f"/0/public/Ticker?pair={pairs_str}"
+            try:
+                response = requests.get(self.base_url + path, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "result" in data:
+                        for kraken_pair, ticker_data in data["result"].items():
+                            # Convert back to our symbol format
+                            our_symbol = convert_symbol_from_exchange(kraken_pair, "kraken")
+                            if our_symbol in symbols:
+                                # Kraken ticker format: ["a"] = ask [price, whole_lot_volume, lot_volume]
+                                # ["b"] = bid [price, whole_lot_volume, lot_volume]
+                                ask = float(ticker_data.get("a", [0])[0])
+                                bid = float(ticker_data.get("b", [0])[0])
+                                
+                                if ask > 0 and bid > 0:
+                                    buy_prices[our_symbol] = ask
+                                    sell_prices[our_symbol] = bid
+                                    valid_symbols.append(our_symbol)
+                                    
+                                    # Update cache
+                                    try:
+                                        self._last_good_bid_ask[our_symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
+                                    except Exception:
+                                        pass
+            except Exception:
+                pass
+            
+            # Fallback to cache for any missing symbols
+            for symbol in symbols:
+                if symbol == "USDC-USD":
+                    continue
+                if symbol not in buy_prices:
+                    cached = self._last_good_bid_ask.get(symbol)
+                    if cached:
+                        ask = float(cached.get("ask", 0.0) or 0.0)
+                        bid = float(cached.get("bid", 0.0) or 0.0)
+                        if ask > 0.0 and bid > 0.0:
+                            buy_prices[symbol] = ask
+                            sell_prices[symbol] = bid
+                            valid_symbols.append(symbol)
+        else:  # robinhood
+            for symbol in symbols:
+                if symbol == "USDC-USD":
+                    continue
+
+                path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
+                response = self.make_api_request("GET", path)
+
+                if response and "results" in response:
+                    result = response["results"][0]
+                    ask = float(result["ask_inclusive_of_buy_spread"])
+                    bid = float(result["bid_inclusive_of_sell_spread"])
+
+                    buy_prices[symbol] = ask
+                    sell_prices[symbol] = bid
+                    valid_symbols.append(symbol)
+
+                    # Update cache for transient failures later
+                    try:
+                        self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
+                    except Exception:
+                        pass
+                else:
+                    # Fallback to cached bid/ask so account value never drops due to a transient miss
+                    cached = None
+                    try:
+                        cached = self._last_good_bid_ask.get(symbol)
+                    except Exception:
+                        cached = None
+
+                    if cached:
+                        ask = float(cached.get("ask", 0.0) or 0.0)
+                        bid = float(cached.get("bid", 0.0) or 0.0)
+                        if ask > 0.0 and bid > 0.0:
+                            buy_prices[symbol] = ask
+                            sell_prices[symbol] = bid
+                            valid_symbols.append(symbol)
 
         return buy_prices, sell_prices, valid_symbols
 
@@ -791,9 +1237,111 @@ class CryptoAPITrading:
     ) -> Any:
         # Fetch the current price of the asset
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
+        if symbol not in current_buy_prices:
+            return None
         current_price = current_buy_prices[symbol]
         asset_quantity = amount_in_usd / current_price
 
+        if self.paper_trading:
+            # Simulate buy order
+            rounded_quantity = round(asset_quantity, 8)
+            asset_code = symbol.replace("-USD", "").replace("-USDT", "")
+            
+            # Check if we have enough buying power
+            if amount_in_usd > self._paper_account["buying_power"]:
+                print(f"[PAPER] Insufficient buying power. Need ${amount_in_usd:.2f}, have ${self._paper_account['buying_power']:.2f}")
+                return {"errors": [{"detail": "Insufficient buying power"}]}
+            
+            # Execute simulated buy
+            self._paper_account["buying_power"] -= amount_in_usd
+            
+            # Update holdings
+            if asset_code not in self._paper_holdings:
+                self._paper_holdings[asset_code] = {"quantity": 0.0, "cost_basis": 0.0, "orders": []}
+            
+            holding = self._paper_holdings[asset_code]
+            old_qty = holding["quantity"]
+            old_cost = holding["cost_basis"] * old_qty if old_qty > 0 else 0.0
+            new_cost = old_cost + amount_in_usd
+            new_qty = old_qty + rounded_quantity
+            holding["quantity"] = new_qty
+            holding["cost_basis"] = new_cost / new_qty if new_qty > 0 else 0.0
+            
+            # Record order for cost basis calculation
+            order_record = {
+                "id": f"paper_{client_order_id}",
+                "side": "buy",
+                "state": "filled",
+                "created_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+                "executions": [{
+                    "quantity": str(rounded_quantity),
+                    "effective_price": str(current_price),
+                }]
+            }
+            holding["orders"].append(order_record)
+            self._paper_orders.append(order_record)
+            
+            # Simulate response
+            response = {
+                "id": f"paper_{client_order_id}",
+                "side": "buy",
+                "state": "filled",
+                "symbol": symbol,
+            }
+            
+            print(f"[PAPER] BUY: {rounded_quantity:.8f} {asset_code} @ ${current_price:.8f} = ${amount_in_usd:.2f}")
+            
+            # Record for GUI history
+            self._record_trade(
+                side="buy",
+                symbol=symbol,
+                qty=float(rounded_quantity),
+                price=float(current_price),
+                avg_cost_basis=float(holding["cost_basis"]),
+                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                tag=tag,
+                order_id=response["id"],
+            )
+            return response
+
+        if self.exchange == "kraken":
+            # Kraken: /0/private/AddOrder endpoint
+            kraken_pair = convert_symbol_to_exchange(symbol, "kraken")
+            rounded_quantity = round(asset_quantity, 8)
+            
+            # Kraken order format: type, ordertype, volume, pair
+            # type: "buy" or "sell"
+            # ordertype: "market" for market orders
+            # volume: quantity in base currency
+            body = {
+                "pair": kraken_pair,
+                "type": "buy",
+                "ordertype": "market",
+                "volume": str(rounded_quantity),
+            }
+            
+            path = "/0/private/AddOrder"
+            response = self.make_api_request("POST", path, json.dumps(body))
+            
+            if response and "error" not in response:
+                # Kraken returns order IDs in "txid" array
+                order_ids = response.get("txid", [])
+                order_id = order_ids[0] if order_ids else None
+                
+                self._record_trade(
+                    side="buy",
+                    symbol=symbol,
+                    qty=float(rounded_quantity),
+                    price=float(current_price),
+                    avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                    pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                    tag=tag,
+                    order_id=order_id,
+                )
+                return {"id": order_id, "side": "buy", "state": "filled", "symbol": symbol}
+            return response
+        
+        # Robinhood
         max_retries = 5
         retries = 0
 
@@ -866,6 +1414,107 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        if self.paper_trading:
+            # Simulate sell order
+            asset_code = symbol.replace("-USD", "").replace("-USDT", "")
+            
+            # Get current sell price
+            if expected_price is None:
+                _, current_sell_prices, _ = self.get_price([symbol])
+                if symbol not in current_sell_prices:
+                    return {"errors": [{"detail": "Could not get price"}]}
+                sell_price = current_sell_prices[symbol]
+            else:
+                sell_price = expected_price
+            
+            # Check if we have enough quantity
+            if asset_code not in self._paper_holdings:
+                return {"errors": [{"detail": "No holdings for this asset"}]}
+            
+            holding = self._paper_holdings[asset_code]
+            if holding["quantity"] < asset_quantity:
+                return {"errors": [{"detail": f"Insufficient quantity. Have {holding['quantity']:.8f}, need {asset_quantity:.8f}"}]}
+            
+            # Execute simulated sell
+            sell_value = asset_quantity * sell_price
+            self._paper_account["buying_power"] += sell_value
+            
+            # Update holdings
+            holding["quantity"] -= asset_quantity
+            if holding["quantity"] <= 0:
+                holding["quantity"] = 0.0
+                holding["cost_basis"] = 0.0
+                holding["orders"] = []
+            
+            # Record order
+            order_record = {
+                "id": f"paper_{client_order_id}",
+                "side": "sell",
+                "state": "filled",
+                "created_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+                "executions": [{
+                    "quantity": str(asset_quantity),
+                    "effective_price": str(sell_price),
+                }]
+            }
+            self._paper_orders.append(order_record)
+            
+            # Simulate response
+            response = {
+                "id": f"paper_{client_order_id}",
+                "side": "sell",
+                "state": "filled",
+                "symbol": symbol,
+            }
+            
+            print(f"[PAPER] SELL: {asset_quantity:.8f} {asset_code} @ ${sell_price:.8f} = ${sell_value:.2f}")
+            
+            # Record for GUI history
+            self._record_trade(
+                side="sell",
+                symbol=symbol,
+                qty=float(asset_quantity),
+                price=float(sell_price),
+                avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                tag=tag,
+                order_id=response["id"],
+            )
+            return response
+
+        if self.exchange == "kraken":
+            # Kraken: /0/private/AddOrder endpoint
+            kraken_pair = convert_symbol_to_exchange(symbol, "kraken")
+            
+            # Kraken order format
+            body = {
+                "pair": kraken_pair,
+                "type": "sell",
+                "ordertype": "market",
+                "volume": str(asset_quantity),
+            }
+            
+            path = "/0/private/AddOrder"
+            response = self.make_api_request("POST", path, json.dumps(body))
+            
+            if response and "error" not in response:
+                order_ids = response.get("txid", [])
+                order_id = order_ids[0] if order_ids else None
+                
+                self._record_trade(
+                    side="sell",
+                    symbol=symbol,
+                    qty=float(asset_quantity),
+                    price=float(expected_price) if expected_price is not None else None,
+                    avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                    pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                    tag=tag,
+                    order_id=order_id,
+                )
+                return {"id": order_id, "side": "sell", "state": "filled", "symbol": symbol}
+            return response
+        
+        # Robinhood
         body = {
             "client_order_id": client_order_id,
             "side": side,
@@ -977,6 +1626,10 @@ class CryptoAPITrading:
 
         total_account_value = buying_power + holdings_sell_value
         in_use = (holdings_sell_value / total_account_value) * 100 if total_account_value > 0 else 0.0
+        
+        # Update paper trading account value
+        if self.paper_trading:
+            self._paper_account["total_account_value"] = total_account_value
 
         # If this tick is incomplete, fall back to last known-good snapshot so the GUI chart never gets a bogus dip.
         if (not snapshot_ok) or (total_account_value <= 0.0):

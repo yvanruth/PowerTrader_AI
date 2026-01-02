@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import glob
 import bisect
+import webbrowser
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import tkinter as tk
@@ -413,16 +414,24 @@ def _now_str() -> str:
 def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     """
     Mirrors your convention:
-      BTC uses main_dir directly
+      BTC uses <main_dir>/BTC folder (if it exists, otherwise falls back to main_dir)
       other coins typically have subfolders inside main_dir (auto-detected)
 
     Returns { "BTC": "...", "ETH": "...", ... }
+    All paths are normalized to handle Windows paths on Unix systems.
     """
     out: Dict[str, str] = {}
     main_dir = main_dir or os.getcwd()
+    # Normalize main_dir to handle Windows paths on Unix systems
+    main_dir = os.path.abspath(os.path.normpath(str(main_dir)))
 
-    # BTC folder
-    out["BTC"] = main_dir
+    # BTC now uses its own folder like other coins
+    btc_path = os.path.join(main_dir, "BTC")
+    if os.path.isdir(btc_path):
+        out["BTC"] = os.path.abspath(os.path.normpath(btc_path))
+    else:
+        # Fallback to main_dir if BTC folder doesn't exist yet
+        out["BTC"] = main_dir
 
     # Auto-detect subfolders
     if os.path.isdir(main_dir):
@@ -432,13 +441,15 @@ def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
                 continue
             sym = name.upper().strip()
             if sym in coins and sym != "BTC":
-                out[sym] = p
+                # Normalize path to handle Windows paths on Unix systems
+                out[sym] = os.path.abspath(os.path.normpath(p))
 
     # Fallbacks for missing ones
     for c in coins:
         c = c.upper().strip()
         if c not in out:
-            out[c] = os.path.join(main_dir, c)  # best-effort fallback
+            # Normalize path to handle Windows paths on Unix systems
+            out[c] = os.path.abspath(os.path.normpath(os.path.join(main_dir, c)))  # best-effort fallback
 
     return out
 
@@ -695,7 +706,8 @@ class CandleChart(ttk.Frame):
         # Reserve bottom space so date+time x tick labels are always visible
         # Also reserve right space so the price labels (Bid/Ask/DCA/Sell) can sit outside the plot.
         # Also reserve a bit of top space so the title never gets clipped.
-        self.fig.subplots_adjust(bottom=0.20, right=0.87, top=0.8)
+        # Increased right margin to accommodate horizontally spread labels
+        self.fig.subplots_adjust(bottom=0.20, right=0.75, top=0.8)
 
         self.ax = self.fig.add_subplot(111)
         self._apply_dark_chart_style()
@@ -920,30 +932,16 @@ class CandleChart(ttk.Frame):
         # Right-side price labels (so you can read Bid/Ask/DCA/Sell at a glance)
         try:
             trans = blended_transform_factory(self.ax.transAxes, self.ax.transData)
-            used_y: List[float] = []
             y0, y1 = self.ax.get_ylim()
-            y_pad = max((y1 - y0) * 0.012, 1e-9)
+            y_pad = max((y1 - y0) * 0.08, 1e-9)  # Vertical spacing between labels (8% of range)
+            x_pos = 1.01  # Fixed x position for all labels
 
-            def _label_right(y: Optional[float], tag: str, color: str) -> None:
-                if y is None:
-                    return
-                try:
-                    yy = float(y)
-                    if (not math.isfinite(yy)) or yy <= 0:
-                        return
-                except Exception:
-                    return
-
-                # Nudge labels apart if levels are very close
-                for prev in used_y:
-                    if abs(yy - prev) < y_pad:
-                        yy = prev + y_pad
-                used_y.append(yy)
-
+            def _label_right(y: float, tag: str, color: str) -> None:
+                """Add a label at the specified y position."""
                 self.ax.text(
-                    1.01,
-                    yy,
-                    f"{tag} {_fmt_price(yy)}",
+                    x_pos,
+                    y,
+                    f"{tag} {_fmt_price(y)}",
                     transform=trans,
                     ha="left",
                     va="center",
@@ -959,13 +957,47 @@ class CandleChart(ttk.Frame):
                     clip_on=False,
                 )
 
-
-
-            # Map to your terminology: Ask=buy line, Bid=sell line
-            _label_right(current_buy_price, "ASK", "purple")
-            _label_right(current_sell_price, "BID", "teal")
-            _label_right(dca_line_price, "DCA", "red")
-            _label_right(trail_line, "SELL", "green")
+            # Collect all labels first
+            labels_to_add = []
+            if current_buy_price is not None:
+                try:
+                    labels_to_add.append((float(current_buy_price), "ASK", "purple"))
+                except Exception:
+                    pass
+            if current_sell_price is not None:
+                try:
+                    labels_to_add.append((float(current_sell_price), "BID", "teal"))
+                except Exception:
+                    pass
+            if dca_line_price is not None:
+                try:
+                    labels_to_add.append((float(dca_line_price), "DCA", "red"))
+                except Exception:
+                    pass
+            if trail_line is not None:
+                try:
+                    labels_to_add.append((float(trail_line), "SELL", "green"))
+                except Exception:
+                    pass
+            
+            # Sort by price (highest first) so labels are displayed from top to bottom
+            labels_to_add.sort(key=lambda x: x[0], reverse=True)
+            
+            # Add labels in sorted order, ensuring vertical spacing
+            used_y: List[float] = []
+            for y, tag, color in labels_to_add:
+                # Adjust y position if too close to previous labels
+                adjusted_y = y
+                for prev_y in used_y:
+                    if abs(adjusted_y - prev_y) < y_pad:
+                        # If new label is above previous, push it up; if below, push it down
+                        if adjusted_y > prev_y:
+                            adjusted_y = prev_y + y_pad
+                        else:
+                            adjusted_y = prev_y - y_pad
+                
+                used_y.append(adjusted_y)
+                _label_right(adjusted_y, tag, color)
         except Exception:
             pass
 
@@ -1513,11 +1545,23 @@ class PowerTraderHub(tk.Tk):
         # coin folders (neural outputs)
         self.coins = [c.upper().strip() for c in self.settings["coins"]]
 
+        # Normalize main_neural_dir to handle Windows paths on Unix systems
+        main_neural_dir = self.settings.get("main_neural_dir", self.project_dir)
+        if not main_neural_dir or (os.name != "nt" and ("C:\\" in str(main_neural_dir) or "C:/" in str(main_neural_dir) or str(main_neural_dir).startswith("C:"))):
+            # Windows path detected on Unix system, use project_dir as fallback
+            main_neural_dir = self.project_dir
+        main_neural_dir = os.path.abspath(os.path.normpath(str(main_neural_dir)))
+        self.settings["main_neural_dir"] = main_neural_dir
+
         # On startup (like on Settings-save), create missing alt folders and copy the trainer into them.
         self._ensure_alt_coin_folders_and_trainer_on_startup()
 
         # Rebuild folder map after potential folder creation
         self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+        # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+        for coin, folder_path in self.coin_folders.items():
+            if folder_path:
+                self.coin_folders[coin] = os.path.abspath(os.path.normpath(str(folder_path)))
 
 
         # scripts
@@ -1804,6 +1848,32 @@ class PowerTraderHub(tk.Tk):
         merged.update(data)
         # normalize
         merged["coins"] = [c.upper().strip() for c in merged.get("coins", [])]
+        
+        # Normalize paths to handle Windows paths on Unix systems
+        # Note: Full normalization with Windows path detection happens in __init__ after project_dir is set
+        if merged.get("main_neural_dir"):
+            try:
+                main_dir = str(merged["main_neural_dir"])
+                # If it's a Windows path on a Unix system, mark it for later replacement
+                if os.name != "nt" and ("C:\\" in main_dir or "C:/" in main_dir or main_dir.startswith("C:")):
+                    # Will be replaced in __init__ with project_dir
+                    merged["main_neural_dir"] = None  # Mark for replacement
+                else:
+                    merged["main_neural_dir"] = os.path.abspath(os.path.normpath(main_dir))
+            except Exception:
+                pass
+        if merged.get("hub_data_dir"):
+            try:
+                hub_dir = str(merged["hub_data_dir"])
+                # If it's a Windows path on a Unix system, mark it for later replacement
+                if os.name != "nt" and ("C:\\" in hub_dir or "C:/" in hub_dir or hub_dir.startswith("C:")):
+                    # Will be replaced in __init__ with project_dir/hub_data
+                    merged["hub_data_dir"] = None  # Mark for replacement
+                else:
+                    merged["hub_data_dir"] = os.path.abspath(os.path.normpath(hub_dir))
+            except Exception:
+                pass
+        
         return merged
 
     def _save_settings(self) -> None:
@@ -1822,6 +1892,8 @@ class PowerTraderHub(tk.Tk):
         try:
             coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
             main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
+            # Normalize main_dir to handle Windows paths on Unix systems
+            main_dir = os.path.abspath(os.path.normpath(str(main_dir)))
 
             trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
 
@@ -1830,6 +1902,9 @@ class PowerTraderHub(tk.Tk):
 
             # Best-effort fallback if the main folder doesn't have it (keeps behavior robust)
             src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
+            # Normalize source trainer path
+            if src_cfg_trainer and os.path.isfile(src_cfg_trainer):
+                src_cfg_trainer = os.path.abspath(os.path.normpath(src_cfg_trainer))
             src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
 
             for coin in coins:
@@ -1837,6 +1912,8 @@ class PowerTraderHub(tk.Tk):
                     continue  # BTC uses main folder; no per-coin folder needed
 
                 coin_dir = os.path.join(main_dir, coin)
+                # Normalize coin directory path
+                coin_dir = os.path.abspath(os.path.normpath(coin_dir))
 
                 created = False
                 if not os.path.isdir(coin_dir):
@@ -1846,6 +1923,8 @@ class PowerTraderHub(tk.Tk):
                 # Only copy into folders created at startup (per your request)
                 if created:
                     dst_trainer_path = os.path.join(coin_dir, trainer_name)
+                    # Normalize destination trainer path
+                    dst_trainer_path = os.path.abspath(os.path.normpath(dst_trainer_path))
                     if (not os.path.isfile(dst_trainer_path)) and os.path.isfile(src_trainer_path):
                         shutil.copy2(src_trainer_path, dst_trainer_path)
         except Exception:
@@ -3118,8 +3197,15 @@ class PowerTraderHub(tk.Tk):
         # If trainer reports it's currently training, it's not "trained" yet.
         try:
             st = _safe_read_json(os.path.join(folder, "trainer_status.json"))
-            if isinstance(st, dict) and str(st.get("state", "")).upper() == "TRAINING":
-                return False
+            if isinstance(st, dict):
+                state = str(st.get("state", "")).upper()
+                if state == "TRAINING":
+                    return False
+                # If state is "FINISHED", check the timestamp to confirm it's recent
+                if state == "FINISHED":
+                    finished_at = st.get("finished_at", 0)
+                    if finished_at and (time.time() - float(finished_at)) <= (14 * 24 * 60 * 60):
+                        return True
         except Exception:
             pass
 
@@ -3226,6 +3312,13 @@ class PowerTraderHub(tk.Tk):
         #   BTC runs from the main neural folder
         #   Alts run from their own coin subfolder
         coin_cwd = self.coin_folders.get(coin, self.project_dir)
+        # Normalize path to handle Windows paths on Unix systems
+        coin_cwd = os.path.abspath(os.path.normpath(str(coin_cwd)))
+        
+        # Special handling for BTC: if the path still contains Windows-style paths, use project_dir as fallback
+        if coin == "BTC" and ("C:\\" in str(coin_cwd) or "C:/" in str(coin_cwd)):
+            coin_cwd = self.project_dir
+            coin_cwd = os.path.abspath(os.path.normpath(str(coin_cwd)))
 
         # Use the trainer script that lives INSIDE that coin's folder so outputs land in the right place.
         trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
@@ -3239,6 +3332,8 @@ class PowerTraderHub(tk.Tk):
                     os.makedirs(coin_cwd, exist_ok=True)
 
                 src_main_folder = self.coin_folders.get("BTC", self.project_dir)
+                # Normalize source folder path
+                src_main_folder = os.path.abspath(os.path.normpath(str(src_main_folder)))
                 src_trainer_path = os.path.join(src_main_folder, trainer_name)
                 dst_trainer_path = os.path.join(coin_cwd, trainer_name)
 
@@ -3248,6 +3343,8 @@ class PowerTraderHub(tk.Tk):
                 pass
 
         trainer_path = os.path.join(coin_cwd, trainer_name)
+        # Normalize trainer path to ensure it's correct for the current OS
+        trainer_path = os.path.abspath(os.path.normpath(trainer_path))
 
         if not os.path.isfile(trainer_path):
             messagebox.showerror(
@@ -3357,6 +3454,10 @@ class PowerTraderHub(tk.Tk):
                 return
 
             self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+            # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+            for c, folder_path in self.coin_folders.items():
+                if folder_path:
+                    self.coin_folders[c] = os.path.abspath(os.path.normpath(str(folder_path)))
 
             pos = self._last_positions.get(coin, {}) if isinstance(self._last_positions, dict) else {}
             buy_px = pos.get("current_buy_price", None)
@@ -3495,9 +3596,17 @@ class PowerTraderHub(tk.Tk):
                 if getattr(self, "_coin_folders_sig", None) != cf_sig:
                     self._coin_folders_sig = cf_sig
                     self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+                    for c, folder_path in self.coin_folders.items():
+                        if folder_path:
+                            self.coin_folders[c] = os.path.abspath(os.path.normpath(str(folder_path)))
             except Exception:
                 try:
                     self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+                    for c, folder_path in self.coin_folders.items():
+                        if folder_path:
+                            self.coin_folders[c] = os.path.abspath(os.path.normpath(str(folder_path)))
                 except Exception:
                     pass
 
@@ -3889,6 +3998,10 @@ class PowerTraderHub(tk.Tk):
         # Rebuild dependent pieces
         self.coins = [c.upper().strip() for c in (self.settings.get("coins") or []) if c.strip()]
         self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+        # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+        for c, folder_path in self.coin_folders.items():
+            if folder_path:
+                self.coin_folders[c] = os.path.abspath(os.path.normpath(str(folder_path)))
 
         # Refresh coin dropdowns (they don't auto-update)
         try:
@@ -4039,6 +4152,10 @@ class PowerTraderHub(tk.Tk):
             if getattr(self, "_coin_folders_sig", None) != sig:
                 self._coin_folders_sig = sig
                 self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+                # Normalize all paths in coin_folders to handle Windows paths on Unix systems
+                for c, folder_path in self.coin_folders.items():
+                    if folder_path:
+                        self.coin_folders[c] = os.path.abspath(os.path.normpath(str(folder_path)))
         except Exception:
             pass
 
@@ -4353,6 +4470,8 @@ class PowerTraderHub(tk.Tk):
         chart_refresh_var = tk.StringVar(value=str(self.settings["chart_refresh_seconds"]))
         candles_limit_var = tk.StringVar(value=str(self.settings["candles_limit"]))
         auto_start_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_scripts", False)))
+        paper_trading_var = tk.BooleanVar(value=bool(self.settings.get("paper_trading", False)))
+        exchange_var = tk.StringVar(value=self.settings.get("exchange", "robinhood"))
 
         r = 0
         add_row(r, "Main neural folder:", main_dir_var, browse="dir"); r += 1
@@ -4401,6 +4520,28 @@ class PowerTraderHub(tk.Tk):
                 api_status_var.set("Not configured ❌ (missing " + ", ".join(missing) + ")")
             else:
                 api_status_var.set("Configured ✅ (credentials found)")
+
+        def _refresh_exchange_api_status() -> None:
+            """Refresh API status based on selected exchange."""
+            if exchange_var.get().lower() == "kraken":
+                key_path = os.path.join(self.project_dir, "kraken_key.txt")
+                secret_path = os.path.join(self.project_dir, "kraken_secret.txt")
+                try:
+                    has_key = os.path.isfile(key_path) and os.path.getsize(key_path) > 0
+                    has_secret = os.path.isfile(secret_path) and os.path.getsize(secret_path) > 0
+                    if has_key and has_secret:
+                        api_status_var.set("Configured ✅ (Kraken credentials found)")
+                    else:
+                        missing = []
+                        if not has_key:
+                            missing.append("kraken_key.txt")
+                        if not has_secret:
+                            missing.append("kraken_secret.txt")
+                        api_status_var.set("Not configured ❌ (missing " + ", ".join(missing) + ")")
+                except Exception:
+                    api_status_var.set("Not configured ❌")
+            else:  # robinhood
+                _refresh_api_status()
 
         def _open_api_folder() -> None:
             """Open the folder where r_key.txt / r_secret.txt live."""
@@ -4944,21 +5085,120 @@ class PowerTraderHub(tk.Tk):
             ttk.Button(save_btns, text="Save", command=do_save).pack(side="left")
             ttk.Button(save_btns, text="Close", command=wiz.destroy).pack(side="left", padx=8)
 
-        ttk.Label(frm, text="Robinhood API:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        def _open_kraken_api_help():
+            import webbrowser
+            messagebox.showinfo(
+                "Kraken API Setup",
+                "To use Kraken API:\n\n"
+                "1. Log in to your Kraken account\n"
+                "2. Go to Settings → API → Create API Key\n"
+                "3. Enable permissions: 'Query Funds' and 'Create & Modify Orders'\n"
+                "4. Copy your API Key and Private Key\n"
+                "5. Create two files in this folder:\n"
+                "   - kraken_key.txt (paste your API Key)\n"
+                "   - kraken_secret.txt (paste your Private Key)\n\n"
+                "Click 'Open Kraken API Page' to go to the API settings."
+            )
+            webbrowser.open("https://www.kraken.com/u/security/api")
+
+        def _open_kraken_api_folder():
+            try:
+                folder = os.path.abspath(self.project_dir)
+                if os.name == "nt":
+                    os.startfile(folder)
+                    return
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                    return
+                subprocess.Popen(["xdg-open", folder])
+            except Exception as e:
+                messagebox.showerror("Couldn't open folder", f"Tried to open:\n{self.project_dir}\n\nError:\n{e}")
+
+        def _clear_kraken_api_files():
+            key_path = os.path.join(self.project_dir, "kraken_key.txt")
+            secret_path = os.path.join(self.project_dir, "kraken_secret.txt")
+            if not messagebox.askyesno(
+                "Delete Kraken API credentials?",
+                "This will delete:\n"
+                f"  {key_path}\n"
+                f"  {secret_path}\n\n"
+                "After deleting, the trader can NOT authenticate until you add the files again.\n\n"
+                "Are you sure you want to delete these files?"
+            ):
+                return
+            try:
+                if os.path.isfile(key_path):
+                    os.remove(key_path)
+                if os.path.isfile(secret_path):
+                    os.remove(secret_path)
+            except Exception as e:
+                messagebox.showerror("Delete failed", f"Couldn't delete the files:\n\n{e}")
+                return
+            _refresh_exchange_api_status()
+            messagebox.showinfo("Deleted", "Deleted kraken_key.txt and kraken_secret.txt.")
+
+        # Update status when exchange changes
+        def _on_exchange_changed(*args):
+            _refresh_exchange_api_status()
+            # Update label text
+            exchange_label_text = "Kraken API:" if exchange_var.get().lower() == "kraken" else "Robinhood API:"
+            api_label.config(text=exchange_label_text)
+            # Update buttons
+            for widget in api_row.winfo_children():
+                widget.destroy()
+            ttk.Label(api_row, textvariable=api_status_var).grid(row=0, column=0, sticky="w")
+            if exchange_var.get().lower() == "kraken":
+                ttk.Button(api_row, text="Setup Help", command=_open_kraken_api_help).grid(row=0, column=1, sticky="e", padx=(10, 0))
+                ttk.Button(api_row, text="Open Kraken API Page", command=lambda: webbrowser.open("https://www.kraken.com/u/security/api")).grid(row=0, column=2, sticky="e", padx=(8, 0))
+                ttk.Button(api_row, text="Open Folder", command=_open_kraken_api_folder).grid(row=0, column=3, sticky="e", padx=(8, 0))
+                ttk.Button(api_row, text="Clear", command=_clear_kraken_api_files).grid(row=0, column=4, sticky="e", padx=(8, 0))
+            else:
+                ttk.Button(api_row, text="Setup Wizard", command=_open_robinhood_api_wizard).grid(row=0, column=1, sticky="e", padx=(10, 0))
+                ttk.Button(api_row, text="Open Folder", command=_open_api_folder).grid(row=0, column=2, sticky="e", padx=(8, 0))
+                ttk.Button(api_row, text="Clear", command=_clear_api_files).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        
+        exchange_var.trace("w", _on_exchange_changed)
+
+        exchange_label_text = "Kraken API:" if exchange_var.get().lower() == "kraken" else "Robinhood API:"
+        api_label = ttk.Label(frm, text=exchange_label_text)
+        api_label.grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
 
         api_row = ttk.Frame(frm)
         api_row.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
         api_row.columnconfigure(0, weight=1)
 
         ttk.Label(api_row, textvariable=api_status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(api_row, text="Setup Wizard", command=_open_robinhood_api_wizard).grid(row=0, column=1, sticky="e", padx=(10, 0))
-        ttk.Button(api_row, text="Open Folder", command=_open_api_folder).grid(row=0, column=2, sticky="e", padx=(8, 0))
-        ttk.Button(api_row, text="Clear", command=_clear_api_files).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        
+        if exchange_var.get().lower() == "kraken":
+            ttk.Button(api_row, text="Setup Help", command=_open_kraken_api_help).grid(row=0, column=1, sticky="e", padx=(10, 0))
+            ttk.Button(api_row, text="Open Kraken API Page", command=lambda: webbrowser.open("https://www.kraken.com/u/security/api")).grid(row=0, column=2, sticky="e", padx=(8, 0))
+            ttk.Button(api_row, text="Open Folder", command=_open_kraken_api_folder).grid(row=0, column=3, sticky="e", padx=(8, 0))
+            ttk.Button(api_row, text="Clear", command=_clear_kraken_api_files).grid(row=0, column=4, sticky="e", padx=(8, 0))
+        else:
+            ttk.Button(api_row, text="Setup Wizard", command=_open_robinhood_api_wizard).grid(row=0, column=1, sticky="e", padx=(10, 0))
+            ttk.Button(api_row, text="Open Folder", command=_open_api_folder).grid(row=0, column=2, sticky="e", padx=(8, 0))
+            ttk.Button(api_row, text="Clear", command=_clear_api_files).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         r += 1
 
-        _refresh_api_status()
+        _refresh_exchange_api_status()
 
+        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
+
+        # Exchange selector
+        ttk.Label(frm, text="Exchange:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        exchange_frame = ttk.Frame(frm)
+        exchange_frame.grid(row=r, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Radiobutton(exchange_frame, text="Robinhood", variable=exchange_var, value="robinhood").pack(side="left", padx=(0, 15))
+        ttk.Radiobutton(exchange_frame, text="Kraken", variable=exchange_var, value="kraken").pack(side="left")
+        r += 1
+
+        chk_paper = ttk.Checkbutton(
+            frm,
+            text="Enable Paper Trading Mode (simulate trades without real money or API credentials)",
+            variable=paper_trading_var
+        )
+        chk_paper.grid(row=r, column=0, columnspan=3, sticky="w", padx=(0, 10), pady=(10, 0)); r += 1
 
         ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
@@ -4979,9 +5219,19 @@ class PowerTraderHub(tk.Tk):
                 # Track coins before changes so we can detect newly added coins
                 prev_coins = set([str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()])
 
-                self.settings["main_neural_dir"] = main_dir_var.get().strip()
+                # Normalize paths to handle Windows paths on Unix systems
+                main_neural_dir = main_dir_var.get().strip()
+                if main_neural_dir:
+                    main_neural_dir = os.path.abspath(os.path.normpath(main_neural_dir))
+                self.settings["main_neural_dir"] = main_neural_dir
+                
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
-                self.settings["hub_data_dir"] = hub_dir_var.get().strip()
+                
+                hub_data_dir = hub_dir_var.get().strip()
+                if hub_data_dir:
+                    hub_data_dir = os.path.abspath(os.path.normpath(hub_data_dir))
+                self.settings["hub_data_dir"] = hub_data_dir
+                
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
                 self.settings["script_trader"] = trader_script_var.get().strip()
@@ -4990,6 +5240,8 @@ class PowerTraderHub(tk.Tk):
                 self.settings["chart_refresh_seconds"] = float(chart_refresh_var.get().strip())
                 self.settings["candles_limit"] = int(float(candles_limit_var.get().strip()))
                 self.settings["auto_start_scripts"] = bool(auto_start_var.get())
+                self.settings["paper_trading"] = bool(paper_trading_var.get())
+                self.settings["exchange"] = exchange_var.get().strip().lower() or "robinhood"
                 self._save_settings()
 
                 # If new coin(s) were added and their training folder doesn't exist yet,
@@ -4999,12 +5251,17 @@ class PowerTraderHub(tk.Tk):
                     added = [c for c in new_coins if c and c not in prev_coins]
 
                     main_dir = self.settings.get("main_neural_dir") or self.project_dir
+                    # Normalize main_dir to handle Windows paths on Unix systems
+                    main_dir = os.path.abspath(os.path.normpath(str(main_dir)))
                     trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
 
                     # Best-effort resolve source trainer path:
                     # Prefer trainer living in the main (BTC) folder; fallback to the configured trainer path.
                     src_main_trainer = os.path.join(main_dir, trainer_name)
                     src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
+                    # Normalize source trainer path
+                    if src_cfg_trainer and os.path.isfile(src_cfg_trainer):
+                        src_cfg_trainer = os.path.abspath(os.path.normpath(src_cfg_trainer))
                     src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
 
                     for coin in added:
@@ -5012,10 +5269,14 @@ class PowerTraderHub(tk.Tk):
                             continue  # BTC uses main folder; no per-coin folder needed
 
                         coin_dir = os.path.join(main_dir, coin)
+                        # Normalize coin directory path
+                        coin_dir = os.path.abspath(os.path.normpath(coin_dir))
                         if not os.path.isdir(coin_dir):
                             os.makedirs(coin_dir, exist_ok=True)
 
                         dst_trainer_path = os.path.join(coin_dir, trainer_name)
+                        # Normalize destination trainer path
+                        dst_trainer_path = os.path.abspath(os.path.normpath(dst_trainer_path))
                         if (not os.path.isfile(dst_trainer_path)) and os.path.isfile(src_trainer_path):
                             shutil.copy2(src_trainer_path, dst_trainer_path)
                 except Exception:
