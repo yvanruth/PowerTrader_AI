@@ -21,6 +21,33 @@ For determining when to DCA, it uses either the current price level from the AI 
 
 For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade.
 
+---
+
+## Wijzigingen ten opzichte van de originele repository
+
+Deze fork bevat de volgende belangrijke wijzigingen en verbeteringen:
+
+- **API Migratie**: Overstap van Kucoin naar Binance API voor price history data, en van Robinhood naar Kraken API voor trading
+- **Paper Trading Mode**: Volledige paper trading functionaliteit toegevoegd om de bot te testen zonder echt geld te gebruiken
+- **Performance Optimalisaties**: 
+  - NumPy vectorized operations voor snellere berekeningen
+  - Numba JIT compilation voor kritieke functies
+  - Caching systeem voor price history (disk) en memories/weights (in-memory)
+  - Early exit optimalisaties voor pattern matching
+- **UI Verbeteringen**:
+  - Exchange selectie (Kraken/Robinhood) in GUI settings
+  - Paper trading toggle in settings
+  - Verbeterde chart label spacing (verticale positionering)
+  - Betere status updates voor training en trading
+- **Robustheid**:
+  - Verbeterde error handling en logging
+  - Cross-platform path normalisatie fixes
+  - Betere foutafhandeling voor API calls
+- **Structuur**:
+  - BTC files verplaatst naar aparte `BTC/` folder
+  - `.gitignore` toegevoegd voor gevoelige bestanden en runtime data
+
+---
 
 # Setup & First-Time Use (Windows)
 
