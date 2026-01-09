@@ -5312,7 +5312,6 @@ if __name__ == "__main__":
     app = PowerTraderHub()
     app.mainloop()
 
-from __future__ import annotations
 import os
 import sys
 import json
