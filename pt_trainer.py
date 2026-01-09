@@ -1881,6 +1881,9 @@ while True:
 													try:
 														indy = 0
 														while True:
+															# Check bounds before accessing lists
+															if indy >= len(moves) or indy >= len(high_moves) or indy >= len(low_moves) or indy >= len(unweighted):
+																break
 															new_memory = 'no'
 															var3 = (moves[indy]*100)
 															high_var3 = (high_moves[indy]*100)
@@ -3251,6 +3254,9 @@ while True:
 													try:
 														indy = 0
 														while True:
+															# Check bounds before accessing lists
+															if indy >= len(moves) or indy >= len(high_moves) or indy >= len(low_moves) or indy >= len(unweighted):
+																break
 															new_memory = 'no'
 															var3 = (moves[indy]*100)
 															high_var3 = (high_moves[indy]*100)
