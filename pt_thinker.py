@@ -139,7 +139,7 @@ def kraken_current_ask(symbol: str) -> float:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
+
         if "result" not in data or not data["result"]:
             raise RuntimeError(f"Kraken ticker returned no results for {symbol} (Kraken: {kraken_symbol}): {data}")
         
@@ -420,21 +420,21 @@ _write_runner_ready(False, stage="starting", ready_coins=[], total_coins=len(CUR
 def init_coin(sym: str):
 	# switch into the coin's folder so ALL existing relative file I/O stays working
 	try:
-		os.chdir(coin_folder(sym))
+	os.chdir(coin_folder(sym))
 	except Exception as e:
 		print(f"Failed to chdir for {sym}: {e}", flush=True)
 		raise
 
 	# per-coin "version" + on/off files (no collisions between coins)
 	try:
-		with open('alerts_version.txt', 'w+') as f:
-			f.write('5/3/2022/9am')
+	with open('alerts_version.txt', 'w+') as f:
+		f.write('5/3/2022/9am')
 
-		with open('futures_long_onoff.txt', 'w+') as f:
-			f.write('OFF')
+	with open('futures_long_onoff.txt', 'w+') as f:
+		f.write('OFF')
 
-		with open('futures_short_onoff.txt', 'w+') as f:
-			f.write('OFF')
+	with open('futures_short_onoff.txt', 'w+') as f:
+		f.write('OFF')
 	except Exception as e:
 		print(f"Failed to write init files for {sym}: {e}", flush=True)
 
@@ -463,15 +463,15 @@ def init_coin(sym: str):
 					the_time = 0.0
 					tf_times_local.append(the_time)
 					ind += 1
-					continue
+				continue
 
 		if retry_count < max_retries:
-			history_list = history.split("], [")
-			ind += 1
-			try:
+		history_list = history.split("], [")
+		ind += 1
+		try:
 				if len(history_list) >= 2:
-					working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
-					the_time = working_minute[0].replace('[', '')
+			working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
+			the_time = working_minute[0].replace('[', '')
 				else:
 					# Try first element if second doesn't exist
 					if len(history_list) >= 1:
@@ -481,9 +481,9 @@ def init_coin(sym: str):
 						the_time = 0.0
 			except Exception as e:
 				print(f"Failed to parse history for {coin}/{tf_choices[ind-1]}: {e}", flush=True)
-				the_time = 0.0
+			the_time = 0.0
 
-			tf_times_local.append(the_time)
+		tf_times_local.append(the_time)
 
 	st['tf_times'] = tf_times_local
 	states[sym] = st
@@ -491,7 +491,7 @@ def init_coin(sym: str):
 # init all coins once (from GUI settings)
 for _sym in CURRENT_COINS:
 	try:
-		init_coin(_sym)
+	init_coin(_sym)
 	except Exception as e:
 		print(f"Failed to init {_sym}: {e}", flush=True)
 		PrintException()
@@ -509,7 +509,7 @@ for _sym in CURRENT_COINS:
 
 # restore CWD to base after init
 try:
-	os.chdir(BASE_DIR)
+os.chdir(BASE_DIR)
 except:
 	pass
 
@@ -561,7 +561,7 @@ def find_purple_area(lines):
 def step_coin(sym: str):
 	# run inside the coin folder so all existing file reads/writes stay relative + isolated
 	try:
-		os.chdir(coin_folder(sym))
+	os.chdir(coin_folder(sym))
 	except Exception as e:
 		print(f"Failed to chdir for {sym} in step_coin: {e}", flush=True)
 		try:
@@ -686,8 +686,8 @@ def step_coin(sym: str):
 	try:
 		if os.path.isfile(threshold_path):
 			file = open(threshold_path, 'r')
-			perfect_threshold = float(file.read())
-			file.close()
+	perfect_threshold = float(file.read())
+	file.close()
 		else:
 			# Default threshold if file doesn't exist
 			perfect_threshold = 0.5
@@ -1051,7 +1051,7 @@ def step_coin(sym: str):
 			else:
 				low_bound_prices.append(.01)
 				high_bound_prices.append(99999999999999999)
-			
+
 			prices_index += 1
 			if prices_index >= len(high_tf_prices):
 				break
